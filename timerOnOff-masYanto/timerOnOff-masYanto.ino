@@ -6,6 +6,8 @@
 RTC_DS3231 rtc;
 SoftwareSerial espSerial(2, 3);
 
+byte modeManual = 2; // 0 = OFF, 1 = ON, 2 = AUTO
+
 struct Jadwal {
   byte active;
   byte onH, onM, offH, offM;
@@ -30,7 +32,7 @@ void setup() {
     Serial.println(F("RTC Tidak Terdeteksi!")); 
     while (1);
   }
-  loadFromEEPROM();
+  //loadFromEEPROM();
 }
 
 void loop() {
@@ -39,7 +41,7 @@ void loop() {
     char c = espSerial.read();
     if (c == '\n') {
       serialBuffer[bufferIndex] = '\0'; // Tutup string
-      parseJadwal(serialBuffer);        // Proses data
+      prosesPerintah(serialBuffer);        // Proses data
       bufferIndex = 0;                  // Reset index untuk data berikutnya
     } else if (bufferIndex < BUFFER_SIZE - 1) {
       serialBuffer[bufferIndex++] = c;
@@ -54,7 +56,50 @@ void loop() {
   }
 }
 
-// Parsing super cepat dengan C-String dan Pointer
+void prosesPerintah(char* raw) {
+  char* token = strtok(raw, ","); 
+  if (token == NULL) return;
+
+  if (token[0] == 'S') { // Jika perintah Jadwal (Schedule)
+    byte h = atoi(strtok(NULL, ","));
+    jadwal[h].active = atoi(strtok(NULL, ","));
+    jadwal[h].onH    = atoi(strtok(NULL, ","));
+    jadwal[h].onM    = atoi(strtok(NULL, ","));
+    jadwal[h].offH   = atoi(strtok(NULL, ","));
+    jadwal[h].offM   = atoi(strtok(NULL, ","));
+
+    EEPROM.put(h * sizeof(Jadwal), jadwal[h]);
+    Serial.print(F("Jadwal Hari ")); Serial.print(h); Serial.println(F(" Terupdate."));
+  } 
+  else if (token[0] == 'M') { // Jika perintah Manual
+    modeManual = atoi(strtok(NULL, ","));
+    Serial.print(F("Mode Manual: ")); Serial.println(modeManual);
+    
+    // Langsung eksekusi relay tanpa menunggu siklus 10 detik
+    if (modeManual == 1) {
+        digitalWrite(RELAY_PIN, LOW); // Lampu ON
+    } else if (modeManual == 0) {
+        digitalWrite(RELAY_PIN, HIGH); // Lampu OFF
+    } else {
+        checkTimer(); // Jika kembali ke AUTO, langsung cek jadwal saat ini
+    }
+  }
+  else if (token[0] == 'T') { // Jika perintah Sinkronisasi Waktu
+    int y = atoi(strtok(NULL, ","));
+    int m = atoi(strtok(NULL, ","));
+    int d = atoi(strtok(NULL, ","));
+    int hh = atoi(strtok(NULL, ","));
+    int mm = atoi(strtok(NULL, ","));
+    int ss = atoi(strtok(NULL, ","));
+    
+    // Perbarui waktu di modul RTC DS3231
+    rtc.adjust(DateTime(y, m, d, hh, mm, ss));
+    
+    Serial.println(F("Waktu RTC Berhasil Disinkronkan!"));
+  }
+}
+
+/*/ Parsing super cepat dengan C-String dan Pointer
 void parseJadwal(char* raw) {
   char* token = strtok(raw, ","); // Ambil token pertama ("S")
   
@@ -75,9 +120,13 @@ void parseJadwal(char* raw) {
   Serial.print(F("Jadwal Hari "));
   Serial.print(h);
   Serial.println(F(" Terupdate."));
-}
+}*/
 
 void checkTimer() {
+
+  // GEMBOK MANUAL: Jika tidak sedang mode AUTO, abaikan pengecekan jam
+  if (modeManual != 2) return;
+  
   DateTime now = rtc.now();
   byte h = now.dayOfTheWeek();
   
