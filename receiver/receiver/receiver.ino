@@ -1,15 +1,26 @@
 #include <ESP8266WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>     // TAMBAHAN 1: Library DNS
 
+const byte DNS_PORT = 53;  // Port standar DNS
+DNSServer dnsServer;       // Objek DNS Server
+
+// ... (variabel ssid, password, dan yang lainnya biarkan tetap seperti aslinya) ...
 const char* ssid = "Smart_Lamp";
-const char* password = "00001111";
+const char* password = "01010202";
 
 AsyncWebServer server(80);
 
-// Variabel Global untuk menampung JSON
 bool adaDataBaru = false;
 String payloadJSON = "";
+String rtcTimeData = "Menunggu Sinkronisasi...";
+bool isBusy = false; // Flag Pengaman Tabrakan Data
+uint32_t lastRequestTime = 0; // Timer Polling Waktu
+
+// Variabel Global untuk menampung JSON
+//bool adaDataBaru = false;
+//String payloadJSON = "";
 
 // Simpan UI ke Flash Memory ESP-01
 const char index_html[] PROGMEM = R"rawliteral(
@@ -139,9 +150,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     // Update jam di layar setiap 1 detik
     setInterval(() => {
-        const now = new Date();
-        document.getElementById('liveClock').innerText = now.toLocaleTimeString('id-ID', { hour12: false });
-        document.getElementById('liveDay').innerText = namaHariLokal[now.getDay()] + ', ' + now.toLocaleDateString('id-ID');
+        fetch('/get_rtc')
+        .then(response => response.text())
+        .then(data => {
+            if(data.startsWith("R,")) {
+                let parts = data.split(",");
+                // Format: R, YYYY, MM, DD, HH, MM, SS
+                let hh = parts[4].padStart(2, '0');
+                let mm = parts[5].padStart(2, '0');
+                let ss = parts[6].padStart(2, '0');
+                
+                document.getElementById('liveClock').innerText = `${hh}:${mm}:${ss}`;
+                
+                // Cari nama hari menggunakan object Date Javascript
+                let d = new Date(parts[1], parts[2] - 1, parts[3]);
+                document.getElementById('liveDay').innerText = `Waktu Alat: ${namaHariLokal[d.getDay()]}, ${parts[3]}/${parts[2]}/${parts[1]}`;
+            }
+        }).catch(e => console.log("Koneksi terputus"));
     }, 1000);
 
     // Fungsi kirim waktu HP ke ESP-01
@@ -162,6 +187,18 @@ const char index_html[] PROGMEM = R"rawliteral(
 void setup() {
   Serial.begin(9600);
   WiFi.softAP(ssid, password);
+
+  WiFi.softAP(ssid, password);
+
+  // --- TAMBAHAN 2: MULAI FITUR CAPTIVE PORTAL ---
+  // Membelokkan semua permintaan nama web (apapun itu) ke IP ESP-01
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP()); 
+
+  // Menangkap semua rute yang tidak dikenal dan memaksanya kembali ke halaman utama (IP ESP)
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->redirect("http://192.168.4.1/"); 
+  });
+  // --- AKHIR TAMBAHAN 2 --
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html);
@@ -217,12 +254,34 @@ void setup() {
       request->send(400, "text/plain", "Bad Request");
     }
   });
+
+  server.on("/get_rtc", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", rtcTimeData);
+  });
   server.begin();
 }
 
 void loop() {
+  dnsServer.processNextRequest();
+  // 1. POLLING WAKTU (Master Minta Data)
+  // Hanya lakukan jika TIDAK SEDANG SIBUK mengirim jadwal
+  if (!isBusy && (millis() - lastRequestTime >= 1000)) {
+    Serial.println("W"); // Ketuk Nano minta waktu
+    lastRequestTime = millis();
+  }
+
+  // 2. TANGKAP BALASAN WAKTU DARI NANO
+  while (Serial.available() > 0) {
+    String incoming = Serial.readStringUntil('\n');
+    if (incoming.startsWith("R,")) {
+      rtcTimeData = incoming;
+    }
+  }
+
+  // 3. PROSES SIMPAN JADWAL
   if (adaDataBaru) {
-    // Gunakan DynamicJsonDocument (1024 bytes) agar alokasi aman di tumpukan memori
+    isBusy = true; // KUNCI JALUR KOMUNIKASI (Hentikan Polling 'W')
+    
     DynamicJsonDocument doc(1024); 
     DeserializationError error = deserializeJson(doc, payloadJSON);
     
@@ -234,27 +293,22 @@ void loop() {
         const char* offT = arr[i]["off"];
         byte active = arr[i]["active"];
         
-        // Cek agar pointer tidak null sebelum diproses
         if (onT != nullptr && offT != nullptr) {
             char onH[3] = {onT[0], onT[1], '\0'};
             char onM[3] = {onT[3], onT[4], '\0'};
             char offH[3] = {offT[0], offT[1], '\0'};
             char offM[3] = {offT[3], offT[4], '\0'};
 
+            // Kirim paket jadwal
             Serial.printf("S,%d,%d,%d,%d,%d,%d\n", i, active, atoi(onH), atoi(onM), atoi(offH), atoi(offM));
             
-            // Jeda agar SoftwareSerial Nano tidak kewalahan
-            delay(150); 
+            delay(150); // Jeda agar EEPROM Nano sempat menulis data
         }
       }
-    } else {
-      Serial.println(F("Gagal Parsing JSON Internal"));
-      // Jika ingin melihat error yang spesifik, bisa di-uncomment:
-      // Serial.println(error.c_str()); 
-    }
+    } 
     
-    // Reset data untuk antrean berikutnya
     adaDataBaru = false; 
     payloadJSON = ""; 
+    isBusy = false; // BUKA KEMBALI JALUR KOMUNIKASI (Lanjutkan Polling 'W')
   }
 }
